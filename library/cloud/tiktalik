@@ -1,0 +1,420 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+# This file is part of Ansible
+#
+# Ansible is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Ansible is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+DOCUMENTATION = '''
+---
+module: tiktalik
+short_description: Create/delete a instance/SSH_key in Tiktalik Cloud
+description:
+     - Create/delete a instance in Tiktalik Cloud and optionally waits for it to be 'running', or deploy an SSH key.
+options:
+  command:
+    description:
+     - Which target you want to operate on.
+    default: instance
+    choices: ['instance', 'ssh']
+  state:
+    description:
+     - Indicate desired state of the target.
+    default: present
+    choices: ['present', 'active', 'absent', 'deleted']
+  api_key:
+    description:
+     - Tiktalik api key.
+  api_secret:
+   description:
+     - Tiktalik api secret.
+  uuid:
+    description:
+     - String, the instance id you want to operate on.
+  name:
+    description:
+     - String, this is the host name of the instance - must be formatted by name rules.
+  unique_name:
+    description:
+     - Bool, require unique names.  By default, Tiktalik Cloud allows multiple hosts with the same name.  Setting this to "yes" allows only one host per name.  Useful for idempotence.
+    default: "no"
+    choices: [ "yes", "no" ]
+  size_id:
+    description:
+     - String, this is the id of the size you would like the instance created at.
+  image_uuid:
+    description:
+     - String, this is the uuid of the image you would like the instance created with.
+  ssh_key_uuid:
+    description:
+     - Optional, ssh_key_uuid that you would like to be added to the server
+  wait:
+    description:
+     - Wait for the instance to be in state 'running' before returning.  If wait is "no" an ip address may not be returned.
+    default: "yes"
+    choices: [ "yes", "no" ]
+  wait_timeout:
+    description:
+     - How long before wait gives up, in seconds.
+    default: 300
+
+notes:
+  - Two environment variables can be used, TK_API_KEY and TK_API_SECRET.
+'''
+
+import sys
+import os
+import time
+
+try:
+    from tiktalik.error import TiktalikAPIError
+    from tiktalik.computing.objects import Instance
+    from tiktalik.computing.connection import ComputingConnection
+    from tiktalik.loadbalancer.connection import LoadBalancerConnection
+    from tiktalik.loadbalancer.objects import LoadBalancer
+except ImportError as e:
+    print "failed=True msg='tiktalik required for this module'"
+    sys.exit(1)
+
+
+class TimeoutError(TiktalikAPIError):
+    def __init__(self, msg, id):
+        super(TimeoutError, self).__init__(msg)
+        self.id = id
+
+
+class JsonfyMixIn(object):
+    def to_json(self):
+        return self.__dict__
+
+
+class InstanceModule(JsonfyMixIn):
+    conn = None
+
+    def __init__(self, instance_json):
+        self.state = 10
+        self.__dict__.update(instance_json)
+
+    def is_powered_on(self):
+        return self.state == 12
+
+    def update_attr(self, attrs=None):
+        if attrs:
+            for k, v in attrs.iteritems():
+                setattr(self, k, v)
+        else:
+            # json = self.conn.get_instance(self.uuid)
+            json = self.conn.request("GET", "/instance/" + self.uuid,
+                                     query_params={
+                                         "actions": False,
+                                         "vpsimage": False,
+                                         "cost": False
+                                     })
+
+            self.update_attr(json)
+
+    def power_on(self):
+        assert self.obj.status == 11, 'Can only power on a halted one.'
+        self.obj.start()
+        self.update_attr({'state': 12})
+
+    def ensure_powered_on(self, wait=True, wait_timeout=300):
+        if self.is_powered_on():
+            return
+
+        if self.state == 11:  # powered off
+            self.power_on()
+
+        if wait:
+            end_time = time.time() + wait_timeout
+            while time.time() < end_time:
+                time.sleep(min(20, end_time - time.time()))
+                self.update_attr()
+                if self.is_powered_on():
+                    if not self.interfaces[0].get('ip'):
+                        raise TimeoutError('No ip is found.', self.uuid)
+                    return
+            raise TimeoutError('Wait for instance running timeout', self.id)
+
+    def destroy(self):
+        return self.conn.delete_instance(self.uuid)
+
+    @classmethod
+    def setup(cls, api_key, api_secret):
+        cls.conn = ComputingConnection(api_key, api_secret)
+
+    @classmethod
+    def add(cls, name, size_id, image_uuid, networks, ssh_key=None):
+        if ssh_key:
+            json = cls.conn.create_instance(name, size_id, image_uuid, networks.split(','), ssh_key)
+        else:
+            json = cls.conn.create_instance(name, size_id, image_uuid, networks.split(','))
+
+        instance = cls(json)
+        return instance
+
+    @classmethod
+    def find(cls, uuid=None, name=None):
+        if not uuid and not name:
+            return False
+
+        instances = cls.list_all()
+
+        # Check first by id. tiktalik requires that it be unique
+        for instance in instances:
+            if instance.uuid == uuid:
+                return instance
+
+        # Failing that, check by name.
+        for instance in instances:
+            if instance.hostname == name:
+                return instance
+
+        return False
+
+    @classmethod
+    def list_all(cls):
+        cls.conn.list_instances()
+        response = cls.conn.request("GET", "/instance",
+                                    query_params={
+                                        "actions": False,
+                                        "vpsimage": False,
+                                        "cost": False
+                                    })
+        return map(cls, response)
+
+
+class LoadBalancerModule(JsonfyMixIn):
+    conn = None
+
+    def __init__(self, lb_json):
+        self.enabled = False
+        self.__dict__.update(lb_json)
+
+    def is_enabled(self):
+        return self.enabled
+
+    def update_attr(self, attrs=None):
+        if attrs:
+            for k, v in attrs.iteritems():
+                setattr(self, k, v)
+        else:
+            json = self.conn.request("GET", "/%s" % uuid)
+            self.update_attr(json)
+
+    def enable(self):
+        self.obj.enable()
+        self.update_attr({'enabled': True})
+
+    def ensure_enabled(self):
+        if self.is_enabled():
+            return
+        else:
+            self.enable()
+
+    def destroy(self):
+        return self.obj.delete()
+
+    @classmethod
+    def setup(cls, api_key, api_secret):
+        cls.conn = LoadBalancerConnection(api_key, api_secret)
+
+    @classmethod
+    def add(cls, name, proto, port, backends, domains):
+        params = {
+            "name": name,
+            "type": proto,
+            "backends[]": [
+                "%s:%i:%i" % (b['host'], int(b['port']), int(b['weight']))
+                for b in backends
+            ],
+        }
+
+        if port:
+            params["port"] = port
+
+        if domains:
+            params["domains[]"] = domains
+
+        json = cls.conn.request("POST", "", params)
+
+        lb = cls(json)
+        return lb
+
+    @classmethod
+    def find(cls, uuid=None, name=None):
+        if not uuid and not name:
+            return False
+
+        lbs = cls.list_all()
+
+        # Check first by id. tiktalik requires that it be unique
+        for lb in lbs:
+            if lb.uuid == uuid:
+                return lb
+
+        # Failing that, check by name.
+        for lb in lbs:
+            if lb.name == name:
+                return lb
+
+        return False
+
+    @classmethod
+    def list_all(cls):
+        response = cls.conn.request("GET", "", query_params=dict(history=False))
+        return map(cls, response)
+
+
+def core(module):
+    def getkeyordie(k):
+        v = module.params[k]
+        if v is None:
+            module.fail_json(msg='Unable to load %s' % k)
+        return v
+
+    try:
+        api_key = module.params['api_key'] or os.environ['TK_API_KEY']
+        api_secret = module.params['api_secret'] or os.environ['TK_API_SECRET']
+    except KeyError, e:
+        module.fail_json(msg='Unable to load %s' % e.message)
+
+    changed = True
+    command = module.params['command']
+    state = module.params['state']
+
+    if command == 'instance':
+        InstanceModule.setup(api_key, api_secret)
+        if state in ('active', 'present'):
+
+            # First, try to find a instance by uuid.
+            instance = InstanceModule.find(uuid=module.params['uuid'])
+
+            # If we couldn't find the instance and the user is allowing unique
+            # names, then check to see if a instance with the specified
+            # name already exists.
+            if not instance and module.params['unique_name']:
+                instance = InstanceModule.find(name=getkeyordie('name'))
+
+            # If both of those attempts failed, then create a new instance.
+            if not instance:
+                instance = InstanceModule.add(
+                    name=getkeyordie('name'),
+                    size_id=getkeyordie('size_id'),
+                    image_uuid=getkeyordie('image_uuid'),
+                    networks=getkeyordie('networks'),
+                    ssh_key=getkeyordie('ssh_key_uuid')
+                )
+
+            if instance.is_powered_on():
+                changed = False
+
+            instance.ensure_powered_on(
+                wait=getkeyordie('wait'),
+                wait_timeout=getkeyordie('wait_timeout')
+            )
+
+            module.exit_json(changed=changed, instance=instance.to_json())
+
+        elif state in ('absent', 'deleted'):
+            # First, try to find a instance by uuid.
+            instance = InstanceModule.find(uuid=getkeyordie('uuid'))
+
+            # If we couldn't find the instance and the user is allowing unique
+            # names, then check to see if a instance with the specified
+            # name already exists.
+            if not instance and module.params['unique_name']:
+                instance = InstanceModule.find(name=getkeyordie('name'))
+
+            if not instance:
+                module.exit_json(changed=False, msg='The instance is not found.')
+
+            instance.destroy()
+            module.exit_json(changed=True)
+
+    elif command == 'loadbalancer':
+        LoadBalancerModule.setup(api_key, api_secret)
+        if state in ('active', 'present'):
+
+            # First, try to find a instance by uuid.
+            lb = LoadBalancerModule.find(uuid=module.params['uuid'])
+
+            # If we couldn't find the instance and the user is allowing unique
+            # names, then check to see if a instance with the specified
+            # name already exists.
+            if not lb and module.params['unique_name']:
+                lb = LoadBalancerModule.find(name=getkeyordie('name'))
+
+            # If both of those attempts failed, then create a new instance.
+            if not lb:
+                lb = LoadBalancerModule.add(
+                    name=getkeyordie('name'),
+                    proto=getkeyordie('proto'),
+                    port=getkeyordie('port'),
+                    backends=getkeyordie('backends'),
+                    domains=getkeyordie('domains')
+                )
+
+            if lb.is_enabled():
+                changed = False
+
+            lb.ensure_enabled()
+
+            module.exit_json(changed=changed, lb=lb.to_json())
+
+        elif state in ('absent', 'deleted'):
+            pass
+
+def main():
+    module = AnsibleModule(
+        argument_spec = dict(
+            command = dict(choices=['instance', 'loadbalancer'], default='instance'),
+            state = dict(choices=['active', 'present', 'absent', 'deleted'], default='present'),
+            api_key = dict(aliases=['API_KEY'], no_log=True),
+            api_secret = dict(aliases=['API_SECRET'], no_log=True),
+            name = dict(type='str'),
+            size_id = dict(type='str'),
+            image_uuid = dict(type='str'),
+            ssh_key_uuid = dict(type='str'),
+            uuid = dict(aliases=['instance_id'], type='str'),
+            unique_name = dict(type='bool', choices=BOOLEANS, default='no'),
+            wait = dict(type='bool', choices=BOOLEANS, default='yes'),
+            wait_timeout = dict(default=300, type='int'),
+            networks=dict(type='str'),
+
+            proto=dict(type='str'),
+            port=dict(type='int'),
+            backends=dict(),
+			domains=dict()
+        ),
+        required_together = (
+            ['size_id', 'image_uuid'],
+        ),
+        mutually_exclusive = (
+        ),
+        required_one_of = (
+            ['uuid', 'name'],
+        ),
+    )
+    try:
+        core(module)
+    except TimeoutError as e:
+        module.fail_json(msg=str(e), id=e.id)
+    except (TiktalikAPIError, Exception) as e:
+        module.fail_json(msg=str(e))
+
+# this is magic, see lib/ansible/module_common.py
+#<<INCLUDE_ANSIBLE_MODULE_COMMON>>
+from ansible.module_utils.basic import *
+
+main()
